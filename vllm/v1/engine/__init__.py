@@ -157,6 +157,9 @@ class EngineCoreRequest(
 
     session_id: str | None = None
 
+    # ASGI ingress clock domain and monotonic timestamp for decode benchmarks.
+    latency_ingress: tuple[str, int] | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

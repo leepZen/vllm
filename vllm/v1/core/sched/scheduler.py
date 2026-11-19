@@ -560,6 +560,7 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        latency_has_kv_load = False
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -869,6 +870,8 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if request.latency is not None and request.latency.checked_ns is None:
+                    request.latency.checked_ns = time.monotonic_ns()
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -933,11 +936,18 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
+                        if request.latency is not None:
+                            lookup_start = time.monotonic_ns()
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, block_aligned_local
                             )
                         )
+
+                        if request.latency is not None:
+                            request.latency.lookup(
+                                lookup_start, time.monotonic_ns(), ext_tokens
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1201,6 +1211,8 @@ class Scheduler(SchedulerInterface):
 
                 # Record at admission so unscheduled lookups are not counted.
                 if did_prefix_cache_lookup:
+                    if request.latency is not None and num_external_computed_tokens > 0:
+                        latency_has_kv_load = True
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request, num_new_local_computed_tokens
                     )
@@ -1210,6 +1222,8 @@ class Scheduler(SchedulerInterface):
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    if request.latency is not None:
+                        request.latency.kv_wait_start_ns = time.monotonic_ns()
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
                     # request.num_computed_tokens will not be used anywhere until
@@ -1262,6 +1276,8 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
+                if request.latency is not None and request.latency.admitted_ns is None:
+                    request.latency.admitted_ns = time.monotonic_ns()
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
@@ -1451,6 +1467,7 @@ class Scheduler(SchedulerInterface):
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
 
+        scheduler_output.latency_has_kv_load = latency_has_kv_load
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
@@ -2107,6 +2124,8 @@ class Scheduler(SchedulerInterface):
             should_emit_output = bool(
                 new_token_ids or pooler_output is not None or stopped
             )
+            if request.latency is not None and new_token_ids:
+                request.latency.output(len(new_token_ids), time.monotonic_ns())
             if should_emit_output:
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
@@ -2486,6 +2505,8 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if request.latency is not None:
+                request.latency.queued_ns = time.monotonic_ns()
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -2563,6 +2584,9 @@ class Scheduler(SchedulerInterface):
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
 
+        if request.latency is not None:
+            request.latency.finish()
+            request.latency = None
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -3015,6 +3039,8 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if req.latency is not None:
+                    req.latency.finish_kv_wait(time.monotonic_ns())
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)

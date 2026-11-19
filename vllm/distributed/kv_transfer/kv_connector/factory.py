@@ -5,6 +5,7 @@ import importlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
+from vllm import envs
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.base import (
     KVConnectorBase,
@@ -72,7 +73,12 @@ class KVConnectorFactory:
         # - Co-locate with worker process
         # - Should only be used inside the forward context & attention layer
         # We build separately to enforce strict separation
-        return connector_cls(config, role, kv_cache_config)
+        connector = connector_cls(config, role, kv_cache_config)
+        if envs.VLLM_DECODE_LATENCY_DIR and role == KVConnectorRole.WORKER:
+            from vllm.v1.metrics.decode_worker import install_connector_trace
+
+            install_connector_trace(connector)
+        return connector
 
     @classmethod
     def get_connector_class_by_name(

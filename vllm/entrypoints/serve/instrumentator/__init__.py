@@ -3,8 +3,15 @@
 
 from fastapi import FastAPI
 
+from vllm import envs
+
 
 def register_instrumentator_api_routers(app: FastAPI):
+    if directory := envs.VLLM_DECODE_LATENCY_DIR:
+        from .decode_latency import attach_router
+
+        attach_router(app, directory)
+
     from .basic import router as basic_router
 
     app.include_router(basic_router)

@@ -52,6 +52,7 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+from vllm.v1.metrics import decode_latency
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -521,6 +522,8 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        if decode_latency.DIRECTORY:
+            request.latency_ingress = decode_latency.ingress.get()
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:

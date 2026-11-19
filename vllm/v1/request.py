@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.metrics import decode_latency
 from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -80,6 +81,9 @@ class Request:
         abort_immediately: bool = False,
     ) -> None:
         self.request_id = request_id
+        self.latency = (
+            decode_latency.RequestTiming() if decode_latency.DIRECTORY else None
+        )
         self.client_index = client_index
         self.priority = priority
         self.sampling_params = sampling_params
@@ -240,7 +244,7 @@ class Request:
         request: EngineCoreRequest,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None,
     ) -> "Request":
-        return cls(
+        req = cls(
             request_id=request.request_id,
             client_index=request.client_index,
             prompt_token_ids=request.prompt_token_ids,
@@ -261,6 +265,11 @@ class Request:
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
         )
+        if req.latency is not None:
+            ingress = request.latency_ingress
+            if ingress and ingress[0] == decode_latency.clock_id():
+                req.latency.ingress_ns = ingress[1]
+        return req
 
     def append_output_token_ids(
         self,

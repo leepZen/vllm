@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -130,6 +131,68 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+def test_decode_latency_uses_first_compute_step_after_async_kv(tmp_path, monkeypatch):
+    from transformers import OPTConfig
+
+    from vllm.v1.metrics import decode_latency as trace
+
+    OPTConfig(architectures=["OPTForCausalLM"]).save_pretrained(tmp_path)
+    monkeypatch.setattr(trace, "DIRECTORY", str(tmp_path))
+    scheduler = create_scheduler(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        use_kv_connector=mock_kv(matched_tokens=16, is_async=True),
+    )
+    (req,) = create_requests(num_requests=1, num_tokens=32, max_tokens=1)
+    assert req.latency is not None
+    req.latency.ingress_ns = time.monotonic_ns()
+    scheduler.add_request(req)
+    loading = scheduler.schedule()
+    assert loading.latency_has_kv_load
+    assert req.latency.admitted_ns is None
+    recv = ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        kv_connector_output=KVConnectorOutput(finished_recving={req.request_id}),
+    )
+    scheduler.update_from_output(loading, recv)
+    compute = scheduler.schedule()
+    assert compute.total_num_scheduled_tokens > 0
+    scheduler.update_from_output(
+        compute,
+        ModelRunnerOutput(
+            req_ids=[req.request_id],
+            req_id_to_index={req.request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    stats = trace.summarize(str(tmp_path))
+    assert stats["request_count"] == 1
+    latencies = stats["latencies"]
+    assert latencies["total_ms"]["avg_ms"] == pytest.approx(
+        sum(
+            latencies[field]["avg_ms"]
+            for field in (
+                "ingress_ms",
+                "queue_ms",
+                "admission_ms",
+                "first_compute_to_token_ms",
+                "decode_ms",
+            )
+        )
+    )
+    assert latencies["tpot_ms"]["count"] == 0
+    assert latencies["lookup_call_ms"]["count"] == 1
+    assert latencies["async_kv_wait_ms"]["count"] == 1
 
 
 def test_routed_experts_prompt_start_at_prompt_end():

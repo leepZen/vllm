@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics.decode_worker import forward_scope
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -1906,7 +1907,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 **connector_kwargs, attn_metadata=attn_metadata
             )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with forward_scope():
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1930,22 +1932,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(**connector_kwargs)
-                if ubatch_state is not None:
-                    assert self.ubatch_runner is not None
-                    model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
-                    )
-                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                with forward_scope():
+                    if ubatch_state is not None:
+                        assert self.ubatch_runner is not None
+                        model_output = self.ubatch_runner.run(
+                            self.model, model_inputs, ubatch_state
+                        )
+                    elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        # PIECEWISE is only selected after the graph manager exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
 

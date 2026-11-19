@@ -304,6 +304,10 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Dispatch clock domain and timestamp carried to the worker.
+    latency_dispatch: tuple[str, int] | None = None
+    latency_has_kv_load: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

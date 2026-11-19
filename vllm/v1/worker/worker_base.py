@@ -21,9 +21,11 @@ from vllm.v1.attention.backends.utils import (
     record_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.metrics import decode_latency
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.metrics.decode_worker import DeviceTimings
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 else:
     SchedulerOutput = object
@@ -233,6 +235,7 @@ class WorkerWrapperBase:
         group.
         """
         self.rpc_rank: int = rpc_rank
+        self._latency_device_timings: DeviceTimings | None = None
         self.global_rank: int = self.rpc_rank if global_rank is None else global_rank
 
         # Initialized after init_worker is called
@@ -240,6 +243,8 @@ class WorkerWrapperBase:
         self.vllm_config: VllmConfig
 
     def shutdown(self) -> None:
+        if self._latency_device_timings is not None:
+            self._latency_device_timings.close()
         if self.worker is not None:
             self.worker.shutdown()
 
@@ -347,6 +352,15 @@ class WorkerWrapperBase:
         assert self.vllm_config is not None
         with set_current_vllm_config(self.vllm_config):
             self.worker.initialize_from_config(kv_cache_config)  # type: ignore
+        if (
+            decode_latency.DIRECTORY
+            and (runner := getattr(self.worker, "model_runner", None)) is not None
+        ):
+            from vllm.v1.metrics.decode_worker import install_runner_trace
+
+            device = self.vllm_config.device_config.device_type
+            npu = getattr(torch, "npu", None) if device == "npu" else None
+            self._latency_device_timings = install_runner_trace(runner, npu)
 
     def init_device(self):
         assert self.vllm_config is not None

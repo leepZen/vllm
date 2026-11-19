@@ -86,6 +86,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics import decode_latency as trace
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -586,6 +587,31 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _schedule_batch(self) -> SchedulerOutput:
+        throttle = self._should_throttle_prefills()
+        if not trace.DIRECTORY:
+            return self.scheduler.schedule(throttle)
+        start = time.monotonic_ns()
+        cpu_start = time.thread_time_ns()
+        output = self.scheduler.schedule(throttle)
+        trace.observe(
+            schedule_ms=(time.monotonic_ns() - start) / 1e6,
+            schedule_thread_cpu_ms=(time.thread_time_ns() - cpu_start) / 1e6,
+        )
+        output.latency_dispatch = (trace.clock_id(), time.monotonic_ns())
+        return output
+
+    def _process_model_output(
+        self, scheduler_output: SchedulerOutput, model_output: ModelRunnerOutput
+    ) -> dict[int, EngineCoreOutputs]:
+        start = time.monotonic_ns() if trace.DIRECTORY else None
+        # Process any aborts that happened during model execution.
+        self._process_aborts_queue()
+        outputs = self.scheduler.update_from_output(scheduler_output, model_output)
+        if start is not None:
+            trace.observe(result_processing_ms=(time.monotonic_ns() - start) / 1e6)
+        return outputs
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -597,7 +623,7 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        scheduler_output = self._schedule_batch()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -608,12 +634,7 @@ class EngineCore:
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        engine_core_outputs = self._process_model_output(scheduler_output, model_output)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -655,7 +676,7 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            scheduler_output = self._schedule_batch()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -710,12 +731,7 @@ class EngineCore:
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        engine_core_outputs = self._process_model_output(scheduler_output, model_output)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
