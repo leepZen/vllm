@@ -1070,6 +1070,9 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def prefill_latency(self, reset: bool = False) -> list[Any]:
+        return await self.engine_core.prefill_latency_async(reset)
+
     async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
         if level >= 1:
             await self.renderer.clear_mm_cache_async()

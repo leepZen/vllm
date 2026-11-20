@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -61,6 +62,7 @@ from vllm.v1.kv_cache_interface import (
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+from vllm.v1.metrics.prefill_latency import SchedulerPrefillLatency
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
     RequestSpecDecodeMetrics,
@@ -97,6 +99,9 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self.prefill_latency = (
+            SchedulerPrefillLatency() if envs.VLLM_PREFILL_LATENCY else None
+        )
         self.observability_config = vllm_config.observability_config
         self.spec_decode_metrics_level = (
             self.observability_config.per_request_spec_decode_metrics
@@ -598,6 +603,8 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        latency = self.prefill_latency
+        async_load_ids: list[str] = []
 
         self.kv_cache_manager.new_step_starts()
 
@@ -869,6 +876,8 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if latency is not None:
+                    latency.check(request_id)
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -917,12 +926,22 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
+                    record_lookup = latency is not None and request_id in latency.queued
+                    lookup_start = time.monotonic_ns() if record_lookup else 0
                     (
                         new_computed_blocks,
                         num_new_local_computed_tokens,
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    if latency is not None and record_lookup:
+                        latency.record(
+                            request_id,
+                            "cache_lookup",
+                            lookup_start,
+                            time.monotonic_ns(),
+                            source="local",
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -933,11 +952,33 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
+                        lookup_start = time.monotonic_ns() if record_lookup else 0
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, block_aligned_local
                             )
                         )
+                        if latency is not None and record_lookup:
+                            lookup_end = time.monotonic_ns()
+                            first_lookup = latency.lookup_started.setdefault(
+                                request_id, lookup_start
+                            )
+                            latency.record(
+                                request_id,
+                                "cache_lookup",
+                                lookup_start,
+                                lookup_end,
+                                source="external",
+                                matched_tokens=ext_tokens,
+                            )
+                            if ext_tokens is not None:
+                                latency.lookup_started.pop(request_id)
+                                latency.record(
+                                    request_id,
+                                    "external_lookup_elapsed",
+                                    first_lookup,
+                                    lookup_end,
+                                )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1209,6 +1250,9 @@ class Scheduler(SchedulerInterface):
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
+                    if latency is not None and request_id in latency.queued:
+                        latency.load_started[request_id] = time.monotonic_ns()
+                        async_load_ids.append(request_id)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     step_skipped_waiting.prepend_request(request)
                     # Set num_computed_tokens even though KVs are not yet loaded.
@@ -1259,6 +1303,8 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
+                if latency is not None:
+                    latency.schedule(request_id)
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
@@ -1445,6 +1491,19 @@ class Scheduler(SchedulerInterface):
 
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
+
+        if latency is not None:
+            prefill_ids = (
+                req_id
+                for req_id in num_scheduled_tokens
+                if req_id in latency.queued
+                and self.requests[req_id].num_computed_tokens
+                < self.requests[req_id].num_prompt_tokens
+            )
+            scheduler_output.prefill_latency_request_ids = (
+                *async_load_ids,
+                *prefill_ids,
+            )
 
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
@@ -1876,6 +1935,8 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        latency = self.prefill_latency
+        result_ready_ns = time.monotonic_ns() if latency is not None else 0
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -2174,6 +2235,8 @@ class Scheduler(SchedulerInterface):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
+                if latency is not None and (new_token_ids or finish_reason is not None):
+                    latency.finish(req_id, result_ready_ns if new_token_ids else None)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -2485,6 +2548,8 @@ class Scheduler(SchedulerInterface):
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
+            if self.prefill_latency is not None and request.sampling_params is not None:
+                self.prefill_latency.enqueue(request.request_id)
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
@@ -2554,6 +2619,8 @@ class Scheduler(SchedulerInterface):
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
             request.status = finished_status
+            if self.prefill_latency is not None:
+                self.prefill_latency.finish(request.request_id)
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
         return valid_requests
@@ -3015,6 +3082,17 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if self.prefill_latency is not None:
+                    start = self.prefill_latency.load_started.pop(req_id, None)
+                    if start is not None:
+                        self.prefill_latency.record(
+                            req_id,
+                            "load_cache",
+                            start,
+                            time.monotonic_ns(),
+                            boundary="scheduler_wait_for_remote_kv",
+                            failed=req_id in self.failed_recving_kv_req_ids,
+                        )
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)

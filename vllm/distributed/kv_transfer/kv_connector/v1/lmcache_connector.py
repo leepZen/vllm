@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.prefill_latency import trace_kv_load
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -163,7 +164,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             the same.
 
         """
-        self._lmcache_engine.start_load_kv(forward_context, **kwargs)
+        with trace_kv_load("lmcache_start_load_host"):
+            self._lmcache_engine.start_load_kv(forward_context, **kwargs)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -176,7 +178,8 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        self._lmcache_engine.wait_for_layer_load(layer_name)
+        with trace_kv_load("lmcache_layer_wait_host"):
+            self._lmcache_engine.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self,

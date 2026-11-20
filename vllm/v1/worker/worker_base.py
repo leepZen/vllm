@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
 import torch.nn as nn
 
 import vllm.ir
+from vllm import envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.logger import init_logger
@@ -21,6 +23,7 @@ from vllm.v1.attention.backends.utils import (
     record_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.worker.prefill_latency import WorkerPrefillLatency
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -234,6 +237,9 @@ class WorkerWrapperBase:
         """
         self.rpc_rank: int = rpc_rank
         self.global_rank: int = self.rpc_rank if global_rank is None else global_rank
+        self.prefill_latency = (
+            WorkerPrefillLatency() if envs.VLLM_PREFILL_LATENCY else None
+        )
 
         # Initialized after init_worker is called
         self.worker: WorkerBase
@@ -370,9 +376,35 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        self._apply_mm_cache(scheduler_output)
+        with self.trace_prefill_execution(scheduler_output):
+            self._apply_mm_cache(scheduler_output)
+            return self.worker.execute_model(scheduler_output)
 
-        return self.worker.execute_model(scheduler_output)
+    def trace_prefill_execution(self, scheduler_output: SchedulerOutput):
+        if self.prefill_latency is None:
+            return nullcontext()
+        return self.prefill_latency.execute(self.worker, scheduler_output)
+
+    def trace_prefill_sampling(self):
+        if self.prefill_latency is None:
+            return nullcontext()
+        return self.prefill_latency.sample()
+
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        with self.trace_prefill_sampling():
+            return self.worker.sample_tokens(grammar_output)
+
+    def get_prefill_latency(self) -> dict[str, Any]:
+        return {
+            "rank": self.global_rank,
+            **(self.prefill_latency.snapshot() if self.prefill_latency else {}),
+        }
+
+    def reset_prefill_latency(self) -> None:
+        if self.prefill_latency is not None:
+            self.prefill_latency = WorkerPrefillLatency()
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

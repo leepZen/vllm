@@ -3,6 +3,7 @@
 
 from fastapi import FastAPI
 
+from vllm import envs
 from vllm.logger import init_logger
 
 from .exception_handling.error_response import create_error_response
@@ -20,6 +21,11 @@ def register_vllm_serve_api_routers(app: FastAPI):
     from .instrumentator import register_instrumentator_api_routers
 
     register_instrumentator_api_routers(app)
+
+    if envs.VLLM_PREFILL_LATENCY:
+        from .prefill_latency import router
+
+        app.include_router(router)
 
     from vllm.entrypoints.serve.lora.api_router import (
         attach_router as attach_lora_router,

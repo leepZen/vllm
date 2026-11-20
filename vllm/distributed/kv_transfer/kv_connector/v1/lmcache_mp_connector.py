@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.prefill_latency import trace_kv_load
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
@@ -592,9 +593,10 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             event = torch.cuda.Event(interprocess=True)
             event.record()
 
-        self.worker_adapter.batched_submit_retrieve_requests(
-            request_ids, ops, event, cache_salts=cache_salts
-        )
+        with trace_kv_load("lmcache_mp_retrieve_submit_host"):
+            self.worker_adapter.batched_submit_retrieve_requests(
+                request_ids, ops, event, cache_salts=cache_salts
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """

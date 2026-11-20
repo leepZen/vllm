@@ -55,6 +55,11 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_kv_cache_torch_dtype
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.prefill_latency import (
+    finish_request_kv_load,
+    start_request_kv_load,
+    trace_kv_load,
+)
 from vllm.version import __version__ as VLLM_VERSION
 
 if TYPE_CHECKING:
@@ -603,6 +608,7 @@ class LMCacheConnectorV1Impl:
 
         self.async_loading = config.enable_async_loading
         self.layerwise_retrievers: list[Generator[torch.Tensor | None, None, None]] = []
+        self.layerwise_load_starts: dict[int, tuple[str, int]] = {}
         self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         if role == KVConnectorRole.SCHEDULER:
             # Create lookup client using factory
@@ -793,6 +799,7 @@ class LMCacheConnectorV1Impl:
         """
         self.current_layer = 0
         self.layerwise_retrievers = []
+        self.layerwise_load_starts.clear()
 
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -867,13 +874,15 @@ class LMCacheConnectorV1Impl:
                 if self.enable_blending:
                     # TODO(Jiayi): Need to make prefix caching and blending
                     # compatible
-                    self.blender.blend(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    )
+                    with trace_kv_load("lmcache_blend_call", request.req_id):
+                        self.blender.blend(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        )
                 else:
+                    started = start_request_kv_load(request.req_id)
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
@@ -885,18 +894,22 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
+                    if started is not None:
+                        self.layerwise_load_starts[id(layerwise_retriever)] = (
+                            request.req_id,
+                            started,
+                        )
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                )
-
-                # Check the result
-                num_retrieved_tokens = ret_token_mask.sum().item()
+                with trace_kv_load("lmcache_retrieve_call", request.req_id):
+                    ret_token_mask = self.lmcache_engine.retrieve(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                    )
+                    num_retrieved_tokens = ret_token_mask.sum().item()
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
@@ -931,6 +944,9 @@ class LMCacheConnectorV1Impl:
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
+                timing = self.layerwise_load_starts.pop(id(layerwise_retriever), None)
+                if timing is not None:
+                    finish_request_kv_load(*timing, "lmcache_last_layer_ready")
                 logger.info("Retrieved %s tokens", num_retrieved_tokens)
 
         return
