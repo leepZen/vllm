@@ -42,21 +42,36 @@ class PrefillLatency:
 class SchedulerPrefillLatency(PrefillLatency):
     def __init__(self) -> None:
         super().__init__()
-        self.queued: dict[str, int] = {}
+        # Scheduler enqueue and prefill start, respectively.
+        self.queued: dict[str, tuple[int, int]] = {}
         self.checked: dict[str, int] = {}
         self.lookup_started: dict[str, int] = {}
         self.load_started: dict[str, int] = {}
         self.first_scheduled: dict[str, int] = {}
 
     def enqueue(self, request_id: str) -> None:
-        self.queued[request_id] = monotonic_ns()
+        now = monotonic_ns()
+        self.queued[request_id] = (now, now)
         self.requests.setdefault(request_id, {})
 
+    def record_input_queue(self, request_id: str, start_ns: int, end_ns: int) -> None:
+        self.record(request_id, "input_queue", start_ns, end_ns)
+        if (queued := self.queued.get(request_id)) is not None:
+            scheduler_enqueue_ns, prefill_start_ns = queued
+            # Later ADD messages for a streaming session do not start its prefill.
+            if end_ns <= scheduler_enqueue_ns:
+                self.queued[request_id] = (
+                    scheduler_enqueue_ns,
+                    min(prefill_start_ns, start_ns),
+                )
+
     def check(self, request_id: str) -> None:
-        if request_id in self.queued and request_id not in self.checked:
+        queued = self.queued.get(request_id)
+        if queued is not None and request_id not in self.checked:
+            scheduler_enqueue_ns, _ = queued
             now = monotonic_ns()
             self.checked[request_id] = now
-            self.record(request_id, "waiting", self.queued[request_id], now)
+            self.record(request_id, "waiting", scheduler_enqueue_ns, now)
 
     def schedule(self, request_id: str) -> None:
         if request_id in self.checked and request_id not in self.first_scheduled:
@@ -71,6 +86,7 @@ class SchedulerPrefillLatency(PrefillLatency):
         self.load_started.pop(request_id, None)
         self.first_scheduled.pop(request_id, None)
         if queued is not None and result_ready_ns is not None:
+            _, prefill_start_ns = queued
             now = monotonic_ns()
             self.record(
                 request_id,
@@ -79,7 +95,7 @@ class SchedulerPrefillLatency(PrefillLatency):
                 now,
                 boundary="engine_result_to_first_token",
             )
-            self.record(request_id, "prefill_total", queued, now)
+            self.record(request_id, "prefill_total", prefill_start_ns, now)
 
     def reset(self) -> None:
         self.requests.clear()

@@ -4,6 +4,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -11,6 +12,23 @@ from fastapi.testclient import TestClient
 from vllm.entrypoints.serve.prefill_latency import router
 from vllm.v1.metrics.prefill_device import read_npu_profile
 from vllm.v1.metrics.prefill_latency import SchedulerPrefillLatency
+
+
+def test_prefill_total_starts_at_engine_input_queue():
+    recorder = SchedulerPrefillLatency()
+    with patch(
+        "vllm.v1.metrics.prefill_latency.monotonic_ns", side_effect=[200, 300, 500]
+    ):
+        recorder.enqueue("request")
+        recorder.record_input_queue("request", 50, 100)
+        recorder.check("request")
+        recorder.finish("request", 400)
+
+    spans = recorder.snapshot()["requests"]["request"]
+    assert spans["waiting"][0]["start_ns"] == 200
+    assert spans["prefill_total"] == [
+        {"start_ns": 50, "end_ns": 500, "duration_ns": 450}
+    ]
 
 
 def test_reset_discards_requests_that_were_already_in_flight():

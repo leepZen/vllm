@@ -1574,10 +1574,15 @@ class EngineCoreProc(EngineCore):
         if request_type == EngineCoreRequestType.WAKEUP:
             return
         elif request_type == EngineCoreRequestType.ADD:
-            req, request_wave = request
+            req, request_wave, enqueued_ns = request
+            dequeued_ns = time.monotonic_ns() if enqueued_ns is not None else 0
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+            if enqueued_ns is not None:
+                latency = getattr(self.scheduler, "prefill_latency", None)
+                if latency is not None:
+                    latency.record_input_queue(req.request_id, enqueued_ns, dequeued_ns)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1793,7 +1798,9 @@ class EngineCoreProc(EngineCore):
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
-                            request = self.preprocess_add_request(req)
+                            prepared_req, request_wave = self.preprocess_add_request(
+                                req
+                            )
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -1802,6 +1809,13 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                        enqueued_ns = (
+                            time.monotonic_ns()
+                            if self.prefill_clock_host is not None
+                            and prepared_req.sampling_params is not None
+                            else None
+                        )
+                        request = (prepared_req, request_wave, enqueued_ns)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         request = generic_decoder.decode(data_frames)
                         client_idx, call_id, method, args = request
