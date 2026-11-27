@@ -142,9 +142,10 @@ try:
                 scheduler_output, grammar_output = execute_model_input
                 intermediate_tensors = None
             assert self.worker.model_runner is not None
-            output = self.worker.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            with self.trace_prefill_execution(scheduler_output):
+                output = self.worker.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if self._is_intermediate_tensors(output):
                 if (
                     self.worker.model_runner.supports_mm_inputs
@@ -168,7 +169,8 @@ try:
                 assert not output or not output.req_ids
                 output = scheduler_output, grammar_output, None
             elif output is None:
-                output = self.worker.model_runner.sample_tokens(grammar_output)
+                with self.trace_prefill_sampling():
+                    output = self.worker.model_runner.sample_tokens(grammar_output)
                 # Ensure outputs crossing Ray compiled DAG are serializable.
                 # AsyncModelRunnerOutput holds CUDA events and cannot be
                 # pickled.

@@ -243,6 +243,8 @@ class SchedulerOutput:
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
+    prefill_latency_request_ids: tuple[str, ...] = ()
+    prefill_latency_dispatch: tuple[str, int] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

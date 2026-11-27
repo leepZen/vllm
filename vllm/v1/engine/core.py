@@ -15,6 +15,7 @@ from functools import partial
 from inspect import isclass, signature
 from logging import DEBUG
 from multiprocessing.queues import Queue
+from socket import gethostname
 from typing import Any, TypeVar, cast
 
 import msgspec
@@ -118,6 +119,7 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        self.prefill_clock_host = gethostname() if envs.VLLM_PREFILL_LATENCY else None
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -476,6 +478,14 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _execute_step(self, output: SchedulerOutput):
+        if self.prefill_clock_host is not None and output.prefill_latency_request_ids:
+            output.prefill_latency_dispatch = (
+                self.prefill_clock_host,
+                time.monotonic_ns(),
+            )
+        return self.model_executor.execute_model(output, non_block=True)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -488,7 +498,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        future = self._execute_step(scheduler_output)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
@@ -546,9 +556,7 @@ class EngineCore:
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
+                exec_future = self._execute_step(scheduler_output)
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -851,6 +859,35 @@ class EngineCore:
         kwargs: dict[str, Any] | None = None,
     ) -> list[_R]:
         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+
+    def get_prefill_latency(self) -> dict[str, Any]:
+        recorder = getattr(self.scheduler, "prefill_latency", None)
+        if recorder is None:
+            raise RuntimeError("Prefill latency collection is unavailable")
+        snapshot = recorder.snapshot()
+        workers = self.collective_rpc("get_prefill_latency")
+        for worker in workers:
+            for request_id, segments in worker.pop("requests", {}).items():
+                request = snapshot["requests"].get(request_id)
+                if request is None:
+                    continue
+                for segment, spans in segments.items():
+                    request.setdefault(segment, []).extend(
+                        {**span, "worker_rank": worker["rank"], "host": worker["host"]}
+                        for span in spans
+                    )
+        return {
+            "engine_rank": self.vllm_config.parallel_config.data_parallel_index,
+            **snapshot,
+            "workers": workers,
+        }
+
+    def reset_prefill_latency(self) -> None:
+        recorder = getattr(self.scheduler, "prefill_latency", None)
+        if recorder is None:
+            raise RuntimeError("Prefill latency collection is unavailable")
+        self.collective_rpc("reset_prefill_latency")
+        recorder.reset()
 
     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
         """Preprocess the request.
@@ -1377,10 +1414,15 @@ class EngineCoreProc(EngineCore):
         if request_type == EngineCoreRequestType.WAKEUP:
             return
         elif request_type == EngineCoreRequestType.ADD:
-            req, request_wave = request
+            req, request_wave, enqueued_ns = request
+            dequeued_ns = time.monotonic_ns() if enqueued_ns is not None else 0
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+            if enqueued_ns is not None:
+                latency = getattr(self.scheduler, "prefill_latency", None)
+                if latency is not None:
+                    latency.record_input_queue(req.request_id, enqueued_ns, dequeued_ns)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1569,10 +1611,19 @@ class EngineCoreProc(EngineCore):
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
-                            request = self.preprocess_add_request(req)
+                            prepared_req, request_wave = self.preprocess_add_request(
+                                req
+                            )
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                        enqueued_ns = (
+                            time.monotonic_ns()
+                            if self.prefill_clock_host is not None
+                            and prepared_req.sampling_params is not None
+                            else None
+                        )
+                        request = (prepared_req, request_wave, enqueued_ns)
                     else:
                         request = generic_decoder.decode(data_frames)
 

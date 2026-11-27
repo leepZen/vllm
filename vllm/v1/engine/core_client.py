@@ -215,6 +215,9 @@ class EngineCoreClient(ABC):
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         raise NotImplementedError
 
+    async def prefill_latency_async(self, reset: bool) -> list[Any]:
+        raise NotImplementedError
+
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         raise NotImplementedError
 
@@ -1101,6 +1104,10 @@ class AsyncMPClient(MPClient):
     async def call_utility_async(self, method: str, *args) -> Any:
         return await self._call_utility_async(method, *args, engine=self.core_engine)
 
+    async def prefill_latency_async(self, reset: bool) -> list[Any]:
+        method = "reset_prefill_latency" if reset else "get_prefill_latency"
+        return [await self.call_utility_async(method)]
+
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
@@ -1456,6 +1463,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 ]
             )
         )[0]
+
+    async def prefill_latency_async(self, reset: bool) -> list[Any]:
+        method = "reset_prefill_latency" if reset else "get_prefill_latency"
+        return await asyncio.gather(
+            *(
+                self._call_utility_async(method, engine=engine)
+                for engine in self.core_engines
+            )
+        )
 
     @staticmethod
     async def process_engine_outputs(

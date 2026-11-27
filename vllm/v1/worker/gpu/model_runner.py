@@ -112,6 +112,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.prefill_latency import trace_model_forward
 from vllm.v1.worker.utils import KVBlockZeroer
 
 logger = init_logger(__name__)
@@ -1290,7 +1291,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with trace_model_forward():
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1311,17 +1313,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                with trace_model_forward():
+                    if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                        # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                        # PIECEWISE after the cudagraph manager exists.
+                        assert self.cudagraph_manager is not None
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
+                    else:
+                        # Eager (NONE): call the raw model directly.
+                        model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
