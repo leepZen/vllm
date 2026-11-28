@@ -57,6 +57,14 @@ def test_cache_lookup_aggregates_attempts_by_source():
     recorder.record_cache_lookup(
         "request", 124, 126, source="external", matched_tokens=0
     )
+    recorder.record_cache_lookup(
+        "request", 130, 134, source="external", matched_tokens=8
+    )
+    recorder.record_cache_lookup("request", 140, 142, source="external")
+    recorder.record_cache_lookup(
+        "request", 160, 165, source="external", matched_tokens=16
+    )
+    recorder.record_cache_lookup("request", 180, 181, source="external")
 
     spans = recorder.snapshot()["requests"]["request"]
     assert len(spans["cache_lookup"]) == 2
@@ -73,13 +81,15 @@ def test_cache_lookup_aggregates_attempts_by_source():
         {
             "source": "external",
             "start_ns": 15,
-            "end_ns": 126,
-            "duration_ns": 111,
-            "calls": 2,
-            "total_call_ns": 7,
-            "matched_tokens": 0,
-            "pending_count": 1,
+            "end_ns": 181,
+            "duration_ns": 166,
+            "calls": 6,
+            "total_call_ns": 19,
+            "matched_tokens": None,
+            "pending_count": 3,
             "first_result_call": 2,
+            "later_result_count": 2,
+            "later_result_total_ns": 29,
         },
     ]
     assert spans["external_lookup_elapsed"] == [

@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from collections.abc import Iterable
@@ -85,8 +86,9 @@ def lookup_summary(spans: dict[str, Any]) -> tuple[object, ...]:
             local.append(lookup)
         elif lookup.get("source") == "external":
             external.append(lookup)
-    lookup_elapsed = first_span(spans, "external_lookup_elapsed")
-    result_ns = lookup_elapsed.get("end_ns")
+    result_spans = spans.get("external_lookup_elapsed", [])
+    first_result_span = next(iter(result_spans), {})
+    result_ns = first_result_span.get("end_ns")
     first_result_call = None
     external_calls = 0
     for lookup in external:
@@ -97,8 +99,11 @@ def lookup_summary(spans: dict[str, Any]) -> tuple[object, ...]:
                 result_ns = lookup["end_ns"]
             if result_call is not None:
                 first_result_call = external_calls + result_call
+                if result_ns is None and result_call == lookup.get("calls", 1):
+                    result_ns = lookup["end_ns"]
         external_calls += lookup.get("calls", 1)
-    last_match = external[-1].get("matched_tokens", MISSING) if external else MISSING
+    external_summary = external[-1] if external else {}
+    last_match = external_summary.get("matched_tokens", MISSING)
     local_call_ns = sum(
         lookup.get("total_call_ns", lookup["duration_ns"]) for lookup in local
     )
@@ -108,19 +113,37 @@ def lookup_summary(spans: dict[str, Any]) -> tuple[object, ...]:
     rechecks = (
         external_calls - first_result_call if first_result_call is not None else MISSING
     )
+    first_call_ns = external[0]["start_ns"] if external else None
+    last_call_end_ns = external[-1]["end_ns"] if external else None
+    result_wait_ns = first_result_span.get(
+        "duration_ns", elapsed(first_call_ns, result_ns)
+    )
+    if "later_result_count" in external_summary:
+        later_result_count = external_summary["later_result_count"]
+        later_result_total_ns = external_summary["later_result_total_ns"]
+    elif result_spans:
+        later_results = result_spans[1:]
+        later_result_count = len(later_results)
+        later_result_total_ns = sum(span["duration_ns"] for span in later_results)
+    else:
+        later_result_count = MISSING
+        later_result_total_ns = None
     return (
         sum(lookup.get("calls", 1) for lookup in local),
         ms(local_call_ns if local else None),
         external_calls,
         ms(external_call_ns if external else None),
+        ms(elapsed(first_call_ns, last_call_end_ns)),
         sum(
             lookup.get("pending_count", lookup.get("matched_tokens") is None)
             for lookup in external
         ),
         rechecks,
         "null" if last_match is None else last_match,
-        ms(lookup_elapsed.get("duration_ns")),
+        ms(result_wait_ns),
         ms(elapsed(result_ns, first_span(spans, "scheduling").get("end_ns"))),
+        later_result_count,
+        ms(later_result_total_ns),
     )
 
 
@@ -210,8 +233,10 @@ def print_details(requests: dict[str, Any]) -> None:
         )
 
 
-def print_report(snapshot: dict[str, Any], details: bool) -> None:
+def print_report(snapshot: dict[str, Any], details: bool, partial: bool) -> None:
     print("# Prefill latency report\n")
+    if partial:
+        print("> Partial snapshot. Worker statistics cover complete ranks only.\n")
     print(f"- Request clock: `{snapshot.get('request_clock', MISSING)}`")
     print(
         f"- NPU task profiling: `{snapshot.get('npu_task_profiling_enabled', MISSING)}`"
@@ -237,18 +262,22 @@ def print_report(snapshot: dict[str, Any], details: bool) -> None:
             rows.append(("Mean", *(ms(mean(ns)) if ns else MISSING for ns in samples)))
         table(("Request", *REQUEST_COLUMNS), rows)
         print("### Cache lookup (ms)\n")
+        print("Call sums cover lookup calls. The span also includes gaps.\n")
         table(
             (
                 "Request",
                 "Local calls",
-                "Local sum",
+                "Local call sum",
                 "External calls",
-                "External sum",
+                "External call sum",
+                "External first → last span",
                 "Pending",
                 "Calls after first result",
                 "Last matched tokens",
                 "First call → first result",
                 "First result → scheduled",
+                "Later result spans",
+                "Later result span sum",
             ),
             (
                 (request_id, *lookup_summary(spans))
@@ -267,26 +296,68 @@ def print_report(snapshot: dict[str, Any], details: bool) -> None:
             print_details(requests)
 
 
+def recover_worker_tail(raw: str) -> dict[str, Any]:
+    """Read complete records from a snapshot clipped in the final workers array."""
+    worker_arrays = list(re.finditer(r'"workers"\s*:\s*\[', raw))
+    if not worker_arrays:
+        raise ValueError("no workers array found in the partial snapshot")
+
+    start = worker_arrays[-1].end()
+    snapshot = json.loads(raw[:start] + "]}]}")
+    workers = snapshot["engines"][-1]["workers"]
+    decoder = json.JSONDecoder()
+    remaining = raw[start:].lstrip()
+    while remaining.startswith("{"):
+        try:
+            worker, end = decoder.raw_decode(remaining)
+        except json.JSONDecodeError:
+            break
+        workers.append(worker)
+        remaining = remaining[end:].lstrip()
+        if not remaining.startswith(","):
+            break
+        remaining = remaining[1:].lstrip()
+    if remaining.startswith("]") and remaining.rstrip("]} \t\r\n"):
+        raise ValueError("the final workers array is followed by other data")
+    return snapshot
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trace", type=Path, help="JSON snapshot file, or - for stdin")
     parser.add_argument(
         "--details", action="store_true", help="show every request span"
     )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="read complete records when the final workers array is cut off",
+    )
     args = parser.parse_args()
     try:
         if args.trace == Path("-"):
-            snapshot = json.load(sys.stdin)
+            raw = sys.stdin.read()
         else:
-            with args.trace.open(encoding="utf-8-sig") as stream:
-                snapshot = json.load(stream)
+            raw = args.trace.read_text(encoding="utf-8-sig")
     except (OSError, ValueError) as exc:
         parser.error(f"could not read trace: {exc}")
+
+    partial = False
+    try:
+        snapshot = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if not args.allow_partial:
+            parser.error(f"could not read trace: {exc}")
+        try:
+            snapshot = recover_worker_tail(raw)
+        except (ValueError, KeyError, IndexError, TypeError) as recovery_error:
+            parser.error(f"could not recover partial trace: {recovery_error}")
+        partial = True
 
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("engines"), list):
         parser.error("expected a /v1/prefill_latency snapshot with an engines array")
     try:
-        print_report(snapshot, args.details)
+        print_report(snapshot, args.details, partial)
     except (AttributeError, KeyError, TypeError) as exc:
         parser.error(f"invalid trace data: {exc}")
 

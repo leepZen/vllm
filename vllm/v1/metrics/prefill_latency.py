@@ -117,9 +117,17 @@ class SchedulerPrefillLatency(PrefillLatency):
                 lookup["pending_count"] += 1
                 self.lookup_started.setdefault(request_id, start)
             else:
-                lookup.setdefault("first_result_call", lookup["calls"])
-                first_lookup = self.lookup_started.pop(request_id, start)
-                self.record(request_id, "external_lookup_elapsed", first_lookup, end)
+                result_start = self.lookup_started.pop(request_id, start)
+                if "first_result_call" not in lookup:
+                    lookup["first_result_call"] = lookup["calls"]
+                    lookup["later_result_count"] = 0
+                    lookup["later_result_total_ns"] = 0
+                    self.record(
+                        request_id, "external_lookup_elapsed", result_start, end
+                    )
+                else:
+                    lookup["later_result_count"] += 1
+                    lookup["later_result_total_ns"] += end - result_start
 
     def finish(self, request_id: str, result_ready_ns: int | None = None) -> None:
         queued = self.queued.pop(request_id, None)
